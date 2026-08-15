@@ -2,11 +2,17 @@
  * Regression coverage for issue #34: imported functions used as values must
  * remain visible to `callers`, but as weaker `references` edges rather than
  * being mislabeled as direct calls.
+ *
+ * …and for issue #116, at the bottom: the same rules have to hold in a file
+ * big enough that tree-sitter stops handing back the same JS wrapper object
+ * for a node it already materialized.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildGraph } from "../src/graph/build.js";
 import { callersOf } from "../src/graph/traverse.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
@@ -82,6 +88,112 @@ test("aliased named imports resolve references to the exported symbol", async ()
         edge.target === "src/gate.ts#isActive" &&
         edge.relation === "references",
     ),
+  );
+});
+
+/**
+ * #116: the rules above are enforced by `isDirectCallee`/`isDeclarationName`, which
+ * ask "is this identifier the callee (or the declared name) of its parent?" by
+ * comparing tree-sitter `SyntaxNode` objects with `===`. That compares JS wrappers,
+ * not nodes — and node-tree-sitter only hands back the *same* wrapper while the node
+ * is still in the tree's node cache. Once a scavenge has cleared it, `===` answers
+ * "different node", the guard opens, and a direct call is ALSO booked as a value
+ * reference. Two cold builds of one repo disagreed by up to 37 `references` edges.
+ *
+ * Two things are needed to pin that down, and BOTH matter:
+ *
+ *  - many call sites, not one. Whether a scavenge lands in the window between a
+ *    node being materialized and the guard re-reading it is chance; asking the
+ *    question once is a coin flip (measured ~12/20 on Node 20). Asking it at
+ *    `CALL_SITES` positions in one file is not, because a scavenge anywhere in the
+ *    walk misclassifies the sites after it. That is also why the bulk of this
+ *    fixture is call sites rather than inert padding — the volume IS the assertion.
+ *  - a fixed GC. The child runs with a 1 MB young generation, which makes scavenges
+ *    frequent enough for the cold cache — and therefore the bug — to be reproducible
+ *    instead of occasional. See `reference-scale-probe.ts`.
+ *
+ * Measured on the broken extractor, 20 runs each: 20/20 detected on Node 20.20.2
+ * and on Node 24.8.0. On the fixed extractor, 0/20 on both.
+ */
+const CALL_SITES = 60;
+
+test("a direct call is not also recorded as a value reference, at scale (#116)", () => {
+  const root = tmpRepo("graft-reference-scale-");
+  mkdirSync(join(root, "src"), { recursive: true });
+  writeFileSync(
+    join(root, "src", "dep.ts"),
+    [
+      "export function target(): number { return 1; }",
+      "export function register(fn: () => number): unknown { return fn; }",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "src", "consumer.ts"),
+    [
+      'import { target, register } from "./dep.js";',
+      "",
+      // (b) handed over as a value — a `references` edge
+      "export function usesValue(): unknown { return register(target); }",
+      // (c) both, in one body — BOTH edges, from two distinct occurrences
+      "export function usesBoth(): number { register(target); return target(); }",
+      "",
+      // (d) a block-scoped declaration that happens to reuse the imported name.
+      // It DECLARES a binding, so it is not a use of the import. Module-level, so
+      // `withoutShadowedImports` (which only runs inside a function or method) is
+      // not what protects it — `isDeclarationName` is.
+      "{",
+      "  const target = 0;",
+      "}",
+      "",
+      // (a) the case #116 breaks: every one of these invokes `target` directly, so
+      // each must produce a `calls` edge and no `references` edge.
+      ...Array.from(
+        { length: CALL_SITES },
+        (_, i) => `export function callsTarget${i}(): number { return target(); }`,
+      ),
+      "",
+    ].join("\n"),
+  );
+
+  const probe = join(dirname(fileURLToPath(import.meta.url)), "reference-scale-probe.ts");
+  const run = spawnSync(
+    process.execPath,
+    ["--max-semi-space-size=1", "--import", "tsx", probe, root],
+    { encoding: "utf8" },
+  );
+  assert.equal(run.status, 0, `probe failed:\n${run.stderr}`);
+  const line = run.stdout.split("\n").find((l) => l.startsWith("__EDGES__"));
+  assert.ok(line, `probe printed no edges:\n${run.stdout}\n${run.stderr}`);
+  const edges: Array<{ source: string; relation: string }> = JSON.parse(line.slice("__EDGES__".length));
+  const linked = (from: string, relation: string): boolean =>
+    edges.some((e) => e.source === `src/consumer.ts#${from}` && e.relation === relation);
+
+  // (a) a direct invocation is a call, and ONLY a call — at every one of the sites.
+  const callSites = (relation: string): number =>
+    edges.filter((e) => /^src\/consumer\.ts#callsTarget\d+$/.test(e.source) && e.relation === relation).length;
+  assert.equal(callSites("calls"), CALL_SITES, "every direct call resolves to a calls edge");
+  assert.equal(
+    callSites("references"),
+    0,
+    "an identifier that is the direct callee must not also be booked as a value reference",
+  );
+
+  // (b) the recall #34/#49 bought must survive any fix to (a).
+  assert.equal(linked("usesValue", "references"), true, "a function passed as a value is still a reference");
+
+  // (c) `calls` and `references` may legitimately coexist between the same pair —
+  // here two different occurrences of `target` in one body. Whatever fixes (a)
+  // must not become a blanket "references and calls are mutually exclusive" rule.
+  assert.equal(linked("usesBoth", "calls"), true, "the invoked occurrence yields a calls edge");
+  assert.equal(linked("usesBoth", "references"), true, "the value occurrence yields a references edge");
+
+  // (d) the block-scoped redeclaration is attributed to the file node, since it sits
+  // outside any definition. It names a binding, so it must not reference the import.
+  assert.equal(
+    edges.some((e) => e.source === "src/consumer.ts" && e.relation === "references"),
+    false,
+    "a declaration that reuses an imported name is not a use of the import",
   );
 });
 
